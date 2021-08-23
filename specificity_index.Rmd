@@ -1,0 +1,496 @@
+---
+title: "SRA"
+output: html_document
+---
+
+### Setup
+
+```{r setup}
+library(tidyverse)
+library(tximeta)
+library(SummarizedExperiment)
+library(DESeq2)
+library(ggbeeswarm)
+library(org.Mm.eg.db)
+library(ggsci)
+library(pheatmap)
+
+select <- dplyr::select
+
+anno <- readRDS("R/anno.rds")
+
+```
+
+### Import external metadata
+
+```{r import-external-metadata}
+srp_to_celltype <- tibble(srp = c("SRP065508", 
+                     "SRP108790", 
+                     "SRP157610", 
+                     "SRP165274", 
+                     "SRP212262", 
+                     "SRP278796", 
+                     "SRP051501", 
+                     "SRP051580", 
+                     "SRP144472", 
+                     "SRP165642", 
+                     "SRP155199"), 
+       cell_type = c("astrocytes", 
+                     "astrocytes", 
+                     "oligodendrocytes", 
+                     "gabergic", 
+                     "glutamatergic", 
+                     "camkiiExcitatory", 
+                     "dopaminergic", 
+                     "dopaminergic", 
+                     "microglia", 
+                     "msn", 
+                     "microglia"), 
+       author = c("dougherty", 
+                    "boisvert", 
+                    "voskuhl", 
+                    "dougherty", 
+                    "dougherty", 
+                    "lyons", 
+                    "brichta1", 
+                    "brichta2", 
+                    "haimon", 
+                  "kronman", 
+                  "fryer"
+                    ), 
+       region = "to_fill")
+
+# read in metadata
+read_plus <- function(file){
+  read_delim(file, 
+             delim = "\t") %>%
+    mutate(srp = str_extract(file, "(?<=metadata/)[:alnum:]+")) %>%
+    select(names = Accession, 
+           srp) %>%
+    distinct
+}
+
+# srr metadata
+srr_to_srp <- list.files("input/metadata",
+                    pattern = "SRP",
+                    recursive = T,
+                    full.names = T) %>% 
+    map_df(~read_plus(.))
+
+metadata_external <- srr_to_srp %>%
+  left_join(srp_to_celltype)
+
+# filter for the samples actually used
+srr_subset <- tibble(files = list.files("output/salmon", 
+           pattern = "quant.sf", 
+           recursive = T, 
+           full.names = T), 
+       names = str_extract(files, "(?<=e/)[:alnum:]+"))
+
+metadata_external <- metadata_external %>% 
+  inner_join(srr_subset) %>%
+  mutate(sample_name = names)
+
+```
+
+### Import TRAP metadata
+
+```{r import-trap-metadata}
+
+metadata_trap <- read_delim("input/metadata/metadata_input_20200130.txt", 
+                            delim = "\t") %>%
+  filter(cohort == "C1" & 
+           compartment == "MB" & 
+           fraction == "IP" &
+           !str_detect(collection, "POOL"))
+ 
+files <- list.files(
+  "input/salmon_trap",
+  pattern = "quant.sf",
+  recursive = T,
+  full.names = T
+)
+
+names(files) <- str_extract(files, "(?<=trap/)[0-9]+_[0-9]+")
+
+files <- files[names(files) %in% metadata_trap$fastq_id]
+
+collapse_trap <- metadata_trap %>%
+  select(sample_name, 
+         names = fastq_id)
+
+metadata_trap <- files %>% enframe(name = "names",
+                                   value = "files") %>%
+  mutate(cell_type = "dopaminergic",
+         author = "rwm",
+         region = "to_fill",
+         srp = "rwm") %>%
+  select(names,
+         srp,
+         cell_type,
+         author,
+         region,
+         files) %>%
+  left_join(collapse_trap)
+
+
+
+```
+
+### ~~Combine metadata~~
+
+Until the TRAP data are remapped using the same index as external data, count matrices will have to be merged.
+
+```{r combine-metadata, eval=FALSE, include=FALSE}
+# metadata <- bind_rows(metadata_trap, 
+#           metadata_external)
+```
+
+### Create external tximeta
+
+```{r tximeta-external}
+se_external <- tximeta(metadata_external)
+gse_external <- summarizeToGene(se_external)
+# gse_external <- addIds(gse_external, "GENENAME", gene=TRUE)
+# gse_external <- addIds(gse_external, "SYMBOL", gene=TRUE)
+```
+
+### Create TRAP tximeta
+
+```{r tximeta-trap}
+se_trap <- tximeta(metadata_trap)
+gse_trap <- summarizeToGene(se_trap)
+# gse_trap <- addIds(gse_trap, "GENENAME", gene=TRUE)
+# gse_trap <- addIds(gse_trap, "SYMBOL", gene=TRUE)
+```
+
+### Create combined count matrix and combined metadata
+
+```{r combine-matrix-metadata}
+rownames(gse_external) <- str_extract(rownames(gse_external), "[:alnum:]+(?=.)")
+rownames(gse_trap) <- str_extract(rownames(gse_trap), "[:alnum:]+(?=.)")
+
+common_genes <- intersect(rownames(gse_external),
+                          rownames(gse_trap)) %>% sort
+
+gse_external <- gse_external[rownames(gse_external) %in% common_genes,]
+gse_external <- gse_external[order(rownames(gse_external)),]
+
+gse_trap <- gse_trap[rownames(gse_trap) %in% common_genes,]
+gse_trap <- gse_trap[order(rownames(gse_trap)),]
+
+all(rownames(gse_external) == rownames(gse_trap))
+
+matrix <- cbind(assay(gse_external), assay(gse_trap))
+coldata <- rbind(colData(gse_external), colData(gse_trap))
+
+matrix <- apply(matrix, c(1, 2), as.integer)
+```
+
+### Create matrix and metadata for Hobson, 2021 (FASTQ data not available yet)
+
+```{r hobson, eval=FALSE, include=FALSE}
+# gse180913 <- read_delim("input/metadata/GSE180913_series_matrix_specific.txt", 
+#                         delim = "\t", 
+#                         col_names = F)
+# 
+# gse180913 <- gse180913[,-1] %>% t() %>% as_tibble
+# colnames(gse180913) <- c("title", "source", "region", "age", "genotype", "preparation")
+# 
+# hobson_samples <- gse180913 %>%
+#   filter(genotype == "genotype: RiboTag_DATCrePos" &
+#            str_detect(source, "RiboTag_IP") &
+#            !str_detect(source, "Str") &
+#            !str_detect(region, "osome")) %>% 
+#   pull(title)
+# 
+# rm(gse180913)
+# 
+# # hobson_fulllength <- read_delim("input/count_data/dopaminergic_hobson/GSE180913_BH_full_length_RNAseq.csv.gz", delim = ",")
+# 
+# hobson_pooled <- read_delim("input/count_data/dopaminergic_hobson/GSE180913_BH_pooled_RNAseq.csv.gz", delim = ",")
+# 
+# matrix_hobson <- hobson_pooled[,c(1, which(colnames(hobson_pooled) %in% hobson_samples))]
+# matrix_hobson0 <- as.matrix(matrix_hobson[,-1])
+# rownames(matrix_hobson0) <- str_extract(matrix_hobson$gene_id, "[:alnum:]+(?=.)")
+# matrix_hobson <- matrix_hobson0
+# rm(matrix_hobson0)
+# 
+# common_genes <- sort(intersect(rownames(matrix), rownames(matrix_hobson)))
+# 
+# matrix <- matrix[rownames(matrix) %in% common_genes,]
+# matrix_hobson <- matrix_hobson[rownames(matrix_hobson) %in% common_genes,]
+# 
+# nrow(matrix) == nrow(matrix_hobson)
+# 
+# matrix <- matrix[match(common_genes, rownames(matrix)),]
+# matrix_hobson <- matrix_hobson[match(common_genes, rownames(matrix_hobson)),]
+# 
+# all(rownames(matrix) == rownames(matrix_hobson))
+# 
+# colnames(metadata_external)
+# 
+# metadata_hobson <- tibble(names = colnames(matrix_hobson), 
+#                           srp = "SRP330041", 
+#                           cell_type = "dopaminergic", 
+#                           author = "hobson", 
+#                           region = "to_fill", 
+#                           sample_name = colnames(matrix_hobson))
+# 
+# matrix <- cbind(matrix, matrix_hobson)
+# coldata <- rbind(coldata, metadata_hobson)
+
+```
+
+### Create DESeq object
+
+```{r create-dds}
+
+dds <- DESeqDataSetFromMatrix(matrix, coldata, design = ~1)
+
+dds <- collapseReplicates(dds, groupby = colData(dds)$sample_name, renameCols = T)
+
+dds <- DESeq(dds, 
+             minReplicatesForReplace = Inf, 
+             parallel = T)
+
+# rowRanges(se)
+# 
+# dds <- DESeqDataSet(gse, design = ~1)
+# 
+# dds <- DESeq(dds, 
+#              minReplicatesForReplace = Inf, 
+#              parallel = T)
+# 
+# colData(dds)$counts <- colSums(counts(dds))
+# 
+# colData(dds) %>%
+#   as_tibble() %>%
+#   ggplot(aes(x = srp, 
+#              y = counts)) +
+#   geom_quasirandom() +
+#   scale_y_continuous(limits = c(0, 7e7))
+#   
+# pca <- prcomp(t(assay(vst(dds))))
+# 
+# pca$x %>%
+#   as_tibble(rownames = "names") %>%
+#   # pivot_longer(starts_with("PC"), 
+#   #                          names_to = "pc", 
+#   #                          values_to = "coord") %>%
+#   # mutate(pc = factor(pc, levels = paste0("PC", seq(1, length(unique(pc)), 1)))) %>%
+#   left_join(colData(dds), copy = T) %>%
+#   unite(cell_type_comments, cell_type, comments, remove = F) %>%
+#   ggplot(aes(x = PC1, 
+#             y = PC2, 
+#             colour = cell_type_comments)) +
+#   geom_point()
+
+```
+
+### Size factors are determined by library size
+
+```{r size-factors}
+
+enframe(sizeFactors(dds), 
+        name = "sample_name", 
+        value = "size_factor") %>%
+  left_join(
+    enframe(colSums(counts(dds, normalized = F)), 
+            name = "sample_name", 
+            value = "total_counts")) %>% 
+  pivot_longer(-sample_name, 
+               names_to = "metric", 
+               values_to = "value") %>%
+  left_join(colData(dds), copy = T) %>%
+  ggplot(aes(x = cell_type, 
+             y = value)) +
+  geom_quasirandom() +
+  facet_wrap(vars(metric), 
+             scales = "free")
+
+```
+
+### PCA
+
+```{r pca}
+
+# subset high variance genes
+# rownames(dds)[order(rowVars(assay(vst(dds))))[1:10]]
+# pca <- prcomp(t(assay(vst(dds))[order(rowVars(assay(vst(dds))), decreasing = T)[1:1000],]))
+
+pca <- prcomp(t(assay(vst(dds))))
+
+pca$x %>%
+  as_tibble(rownames = "sample_name") %>%
+  left_join(colData(dds), copy = T) %>%
+  unite(cell_type_author, cell_type, author, remove = F) %>%
+  ggplot(aes(x = PC1, 
+             y = PC2, 
+             colour = cell_type_author)) +
+  geom_point(size = 5) +
+  scale_color_d3(palette = "category20")
+
+pca$x %>%
+  as_tibble(rownames = "sample_name") %>%
+  left_join(colData(dds), copy = T) %>%
+  unite(cell_type_author, cell_type, author, remove = F) %>%
+  ggplot(aes(x = PC2, 
+             y = PC3, 
+             colour = cell_type_author)) +
+  geom_point(size = 5) +
+  scale_color_d3(palette = "category20")
+
+pca$x %>%
+  as_tibble(rownames = "sample_name") %>%
+  left_join(colData(dds), copy = T) %>%
+  unite(cell_type_author, cell_type, author, remove = F) %>%
+  ggplot(aes(x = PC3, 
+             y = PC4, 
+             colour = cell_type_author)) +
+  geom_point(size = 5) +
+  scale_color_d3(palette = "category20")
+
+pca$x %>%
+  as_tibble(rownames = "sample_name") %>%
+  pivot_longer(-sample_name, 
+               names_to = "pc", 
+               values_to = "coord") %>%
+  mutate(pc = factor(pc, levels = paste0("PC", seq(1, ncol(pca$x), 1)))) %>%
+  filter(pc %in% paste0("PC", seq(1, 10, 1))) %>%
+  left_join(colData(dds), copy = T) %>%
+  ggplot(aes(x = pc, 
+             y = coord, 
+             colour = cell_type)) +
+  geom_point() +
+  scale_color_d3()
+
+```
+
+### Hierarchical Clustering of Datasets
+
+```{r hclust}
+
+vsd <- assay(vst(dds))
+vsd_scale <- vsd %>% t %>% scale %>% t
+
+vsd_scale_nan <- vsd_scale[rowSums(is.nan(vsd_scale)) == 182,]
+dim(vsd_scale_nan)
+
+vsd_scale <- vsd_scale[rowSums(is.nan(vsd_scale)) == 0,]
+
+dist <- dist(t(vsd_scale))
+
+hclust_vsd <- hclust(dist)
+
+hclust_vsd$labels <- colData(dds)$cell_type[match(hclust_vsd$labels, colData(dds)$sample_name)]
+
+plot(hclust_vsd)
+```
+
+### Calculate cell type means
+
+```{r cell-type-means}
+
+colData(dds)$cell_type %>% unique
+
+dds_pSI <- dds[,!colData(dds)$cell_type %in% c("camkiiExcitatory", 
+                                               "msn") &
+                 !colData(dds)$author %in% c("haimon")]
+
+counts_pSI <- counts(dds_pSI, normalized = T)
+
+colnames(counts_pSI) <- colData(dds_pSI)$cell_type
+
+split_factor <- split(colnames(counts_pSI), colData(dds_pSI)$cell_type)
+mean_counts_pSI <- do.call(cbind, lapply(split_factor, function(i) rowMeans(counts_pSI[, i])))
+
+
+
+```
+
+### Specificity Index
+
+```{r psi}
+
+pSI <- pSI::specificity.index(mean_counts_pSI)
+
+test_pSI %>%
+  as_tibble(rownames = "ensembl_gene_id") %>%
+  left_join(anno) %>% View
+
+pSI_noNA <- pSI[!rowSums(is.na(pSI)) == 6,]
+
+counts_noNA <- counts_pSI[rownames(counts_pSI) %in% rownames(pSI_noNA),]
+
+mean_counts_pSI_noNA <- mean_counts_pSI[rownames(mean_counts_pSI) %in% rownames(pSI_noNA),]
+
+
+```
+
+### Heatmap of specific genes
+
+```{r heatmap}
+t(scale(
+  t(mean_counts_pSI_noNA[1:1000,]),
+  center = T,
+  scale = T
+)) %>% pheatmap(cluster_cols = F,
+                cluster_rows = T, 
+                treeheight_row = 0, 
+                show_rownames = F)
+```
+
+### Specific dopaminergic with TRAP enrichment and publications
+
+```{r}
+
+
+
+pSI_noNA %>%
+  as_tibble(rownames = "ensembl_gene_id") %>%
+  filter(!is.na(dopaminergic)) %>%
+  select(ensembl_gene_id, dopaminergic) %>%
+  arrange(dopaminergic) %>%
+  left_join(publications_all_genes) %>% 
+  left_join(anno) %>% 
+  left_join(MB_FRACTION_META_SIMPLE) %>% View
+```
+
+```{r}
+
+counts(dds, normalized = T)[rownames(dds) == "ENSMUSG00000000134",] %>%
+  enframe(name = "sample_name", 
+          value = "count") %>%
+  left_join(colData(dds), copy = T) %>%
+  ggplot(aes(x = cell_type, 
+             y = count)) +
+  geom_quasirandom()
+
+```
+
+```{bash engine.opts="-l"}
+
+
+
+source /home/peter/miniconda3/etc/profile.d/conda.sh
+
+conda activate entrez
+
+
+
+cat output/srr_codes.txt | while read line ; do echo "esearch -db sra -query $line | efetch -format runinfo | head -n 2 | tail -n 1 | sed "s/,/\\\\t/g"" ; done > esearch.sh
+
+chmod u+x esearch.sh
+
+./esearch.sh >> esearch.txt
+
+head -n 1 output/srr_codes.txt | while read line ; do echo "esearch -db sra -query $line | efetch -format runinfo | head -n 1 | sed "s/,/\\\\t/g"" ; done > esearch_header.sh
+
+chmod u+x esearch_header.sh
+
+./esearch_header.sh > esearch_header.txt
+
+cat esearch_header.txt esearch.txt > esearch_metadata.txt
+
+```

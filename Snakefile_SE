@@ -1,0 +1,162 @@
+import os
+from os import path
+import pandas as pd
+import yaml
+
+# SNAKEDIR = path.dirname(workflow.snakefile)
+
+configfile: "config.yml"
+
+IDS = glob_wildcards("input/fastq/se/{fastq_id}.fastq.gz")
+
+rule all:
+    input:
+        "output/qc/multiqc/se/multiqc_report.html",
+
+rule fastqc:
+    input:
+        ancient("input/fastq/se/{fastq_id}.fastq.gz")
+    output: #Note that the output name needs to match the original fastq file in order for the R package ngsReports to correctly identify it!
+        html="output/qc/fastqc/se/{fastq_id}_fastqc.html",
+        zip="output/qc/fastqc/se/{fastq_id}_fastqc.zip" # the suffix _fastqc.zip is necessary for multiqc to find the file. If not using multiqc, you are free to choose an arbitrary filename
+    params:
+        partition = 'normal'
+    conda:
+        "env.yml"
+    shell:
+        """
+        mkdir -p output/qc/fastqc/se ; \
+        fastqc {input} -o output/qc/fastqc/se
+        """
+
+rule cutadapt:
+    input:
+        fq = ancient("input/fastq/se/{fastq_id}.fastq.gz")
+    output:
+        fq_trimmed = "output/fastq_trimmed/se/{fastq_id}_trimmed.fastq.gz"
+    conda:
+        "env.yml"
+    params:
+        partition = 'normal',
+        basename = "{fastq_id}"
+    resources:
+        cpus = 8
+    shell: #cores is set to 4 intentionally, as cutadapt overprovisions
+        """
+        cutadapt \
+        -j {resources.cpus} \
+        --minimum-length 1 \
+        {input.fq} \
+        -o {output.fq_trimmed}
+        """
+
+rule fastqc_trimmed:
+    input:
+        "output/fastq_trimmed/se/{fastq_id}_trimmed.fastq.gz"
+    output: #Note that the output name needs to match the original fastq file in order for the R package ngsReports to correctly identify it!
+        html="output/qc/fastqc_trimmed/se/{fastq_id}_trimmed_fastqc.html",
+        zip="output/qc/fastqc_trimmed/se/{fastq_id}_trimmed_fastqc.zip" # the suffix _fastqc.zip is necessary for multiqc to find the file. If not using multiqc, you are free to choose an arbitrary filename
+    params:
+        partition = 'normal'
+    conda:
+        "env.yml"
+    shell:
+        """
+        mkdir -p output/qc/fastqc_trimmed/se ; \
+        fastqc {input} -o output/qc/fastqc_trimmed/se
+        """
+
+rule download_references:
+    output:
+        references = directory("input/index/references"),
+        txome_fasta = "input/index/references/tx.fa",
+        genome_fasta = "input/index/references/genome.fa",
+        gtf = "input/index/references/annotation.gtf"
+    params:
+        partition = 'normal',
+        txome_fasta_ftp = config["txome_fasta_mouse"],
+        genome_fasta_ftp = config["genome_fasta_mouse"],
+        gtf_ftp = config["gtf_mouse"]
+    shell:
+        """
+        mkdir -p {output.references} ; \
+        wget -O {output.txome_fasta}.gz {params.txome_fasta_ftp} ; \
+        wget -O {output.genome_fasta}.gz {params.genome_fasta_ftp} ; \
+        wget -O {output.gtf}.gz {params.gtf_ftp} ; \
+        pigz -dr {output.references}
+        """
+
+#salmon index
+#https://combine-lab.github.io/alevin-tutorial/2019/selective-alignment/
+rule salmon_index:
+    input:
+        txome_fasta = rules.download_references.output.txome_fasta,
+        genome_fasta = rules.download_references.output.genome_fasta,
+        gtf = rules.download_references.output.gtf
+    output:
+        decoys_txt = "input/index/salmon/decoys.txt",
+        gentrome_fasta = "input/index/salmon/gentrome.fa",
+        decoy_index = directory("input/index/salmon/salmon_decoy_index")
+    conda:
+        "env.yml"
+    params:
+        partition = 'avon'
+    resources:
+        cpus = 12,
+        mem_mb = 32000,
+        time_min = 120
+    shell:
+        """
+        mkdir -p input/index/salmon ; \
+        grep "^>" {input.genome_fasta} | cut -d " " -f 1 > {output.decoys_txt} ; \
+        sed -i.bak -e 's/>//g' {output.decoys_txt} ; \
+        cat {input.txome_fasta} {input.genome_fasta} > {output.gentrome_fasta} ; \
+        salmon index -t {output.gentrome_fasta} \
+        -d {output.decoys_txt} \
+        -p {resources.cpus} \
+        -i {output.decoy_index} \
+        --gencode
+        """
+
+rule salmon_quant: ## map reads using salmon mapping mode
+    input:
+       index = rules.salmon_index.output.decoy_index,
+       fq = rules.cutadapt.output.fq_trimmed
+    output:
+       salmon_quant_folder = directory("output/salmon/se/{fastq_id}")
+    conda:
+        "env.yml"
+    params:
+        partition = 'hudson' ## this is because salmon reloads the index every time it runs - network delay if running on avon
+    resources:
+        cpus = 8,
+        mem_mb = 32000,
+        time_min = 120
+    shell:
+        """
+        salmon quant -p {resources.cpus} \
+        -i {input.index} \
+        -l A -r {input.fq} \
+        --validateMappings \
+        --gcBias \
+        --seqBias \
+        -o {output.salmon_quant_folder}
+        """
+
+rule multiqc:
+    input:
+        expand("output/salmon/se/{fastq_id}", fastq_id=IDS.fastq_id),
+        expand("output/qc/fastqc/se/{fastq_id}_fastqc.html", fastq_id=IDS.fastq_id),
+        expand("output/qc/fastqc_trimmed/se/{fastq_id}_trimmed_fastqc.html", fastq_id=IDS.fastq_id)
+    output:
+        html="output/qc/multiqc/se/multiqc_report.html"
+    conda:
+        "env.yml"
+    params:
+        partition = 'hudson'
+    shell:
+        """
+        mkdir -p output/qc/multiqc/se ; \
+        multiqc output -o output/qc/multiqc/se \
+        --config input/multiqc_config.yaml
+        """
